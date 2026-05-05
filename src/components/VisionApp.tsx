@@ -338,35 +338,53 @@ export function VisionApp() {
     [draw, runVideoLoop, stopCameraStream, stopLoop],
   );
 
+  const { theme, toggle } = useTheme();
+
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <header className="border-b border-border/60 backdrop-blur sticky top-0 z-10 bg-background/70">
-        <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Sparkles className="h-5 w-5 text-primary" />
-            <h1 className="text-lg font-semibold tracking-tight">
+      <header className="border-b border-border sticky top-0 z-10 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+        <div className="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="h-8 w-8 rounded-md bg-primary/10 text-primary flex items-center justify-center shrink-0">
+              <Sparkles className="h-4 w-4" />
+            </div>
+            <h1 className="text-sm font-semibold tracking-tight truncate">
               BrowserVision
             </h1>
-            <Badge variant="secondary" className="ml-2 hidden sm:inline-flex">
-              100% in-browser · WASM
+            <Badge variant="secondary" className="ml-1 hidden md:inline-flex text-[10px] font-normal">
+              <ShieldCheck className="h-3 w-3 mr-1" /> 100% on-device · WASM
             </Badge>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <Button
               size="sm"
-              variant={mode === "camera" ? "default" : "secondary"}
+              variant={mode === "camera" ? "default" : "ghost"}
               onClick={startCamera}
               disabled={loading}
+              className="h-8"
             >
-              <Camera className="h-4 w-4" /> Camera
+              <Camera className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Camera</span>
             </Button>
             <Button
               size="sm"
-              variant="secondary"
+              variant={mode !== "camera" ? "default" : "ghost"}
               onClick={() => fileInputRef.current?.click()}
               disabled={loading}
+              className="h-8"
             >
-              <ImageIcon className="h-4 w-4" /> Image / Video
+              <ImageIcon className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Upload</span>
+            </Button>
+            <div className="w-px h-5 bg-border mx-1" />
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={toggle}
+              className="h-8 w-8"
+              aria-label="Toggle theme"
+            >
+              {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
             </Button>
             <input
               ref={fileInputRef}
@@ -383,16 +401,15 @@ export function VisionApp() {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-4 py-6 grid lg:grid-cols-[1fr_320px] gap-6">
-        <Card className="relative overflow-hidden bg-card border-border/60 aspect-video flex items-center justify-center">
+      <main className="max-w-6xl mx-auto px-4 py-4 grid lg:grid-cols-[1fr_300px] gap-4">
+        <Card className="relative overflow-hidden bg-muted/30 border-border aspect-video flex items-center justify-center p-0">
           {loading && (
-            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-background/80 backdrop-blur">
-              <Loader2 className="h-8 w-8 animate-spin text-primary" />
-              <p className="text-sm text-muted-foreground">{loadProgress}</p>
+            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-background/90 backdrop-blur">
+              <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              <p className="text-xs text-muted-foreground">{loadProgress}</p>
             </div>
           )}
 
-          {/* Source layer */}
           {mode === "image" && imageUrl ? (
             <img
               ref={imageRef}
@@ -412,69 +429,71 @@ export function VisionApp() {
             />
           )}
 
-          {/* Overlay canvas */}
           <canvas
             ref={canvasRef}
             className="absolute inset-0 w-full h-full pointer-events-none object-contain"
           />
 
           {!loading && (
-            <div className="absolute top-3 left-3 flex gap-2 text-xs">
-              <Badge variant="secondary">{stats.fps} FPS</Badge>
-              <Badge variant="secondary" className="capitalize">
+            <div className="absolute top-2.5 left-2.5 flex gap-1.5 text-[10px]">
+              <Badge variant="secondary" className="font-mono tabular-nums backdrop-blur bg-background/70">
+                {stats.fps} FPS
+              </Badge>
+              <Badge variant="secondary" className="capitalize backdrop-blur bg-background/70">
                 {mode}
               </Badge>
             </div>
           )}
         </Card>
 
-        <aside className="space-y-4">
-          <Card className="p-4">
-            <h2 className="text-sm font-medium mb-2 text-muted-foreground">
-              Objects
+        <aside className="space-y-3">
+          <Card className="p-3">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
+              <Boxes className="h-3 w-3" /> Objects
             </h2>
             {stats.objects.length === 0 ? (
               <p className="text-xs text-muted-foreground">None detected</p>
             ) : (
-              <div className="flex flex-wrap gap-1.5">
+              <div className="flex flex-wrap gap-1">
                 {stats.objects.map((o, i) => (
-                  <Badge key={i} variant="default" className="capitalize">
-                    {o.label} · {(o.score * 100).toFixed(0)}%
+                  <Badge key={i} variant="default" className="capitalize text-[10px] font-normal py-0 px-1.5 h-5">
+                    {o.label} <span className="opacity-60 ml-1">{(o.score * 100).toFixed(0)}%</span>
                   </Badge>
                 ))}
               </div>
             )}
           </Card>
-          <Card className="p-4">
-            <h2 className="text-sm font-medium mb-2 text-muted-foreground">
-              Face expression
+
+          <Card className="p-3">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-1.5 flex items-center gap-1.5">
+              <Smile className="h-3 w-3" /> Expression
             </h2>
-            <p className="text-2xl font-semibold">
+            <p className="text-xl font-semibold text-foreground">
               {stats.expression ?? "—"}
             </p>
           </Card>
-          <Card className="p-4">
-            <h2 className="text-sm font-medium mb-2 text-muted-foreground">
-              Gestures
+
+          <Card className="p-3">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
+              <Hand className="h-3 w-3" /> Gestures
             </h2>
             {stats.gestures.length === 0 ? (
               <p className="text-xs text-muted-foreground">No hands detected</p>
             ) : (
-              <div className="flex flex-wrap gap-1.5">
+              <div className="flex flex-wrap gap-1">
                 {stats.gestures.map((g, i) => (
-                  <Badge key={i} variant="secondary">
-                    {g.label} · {(g.score * 100).toFixed(0)}%
+                  <Badge key={i} variant="secondary" className="text-[10px] font-normal py-0 px-1.5 h-5">
+                    {g.label} <span className="opacity-60 ml-1">{(g.score * 100).toFixed(0)}%</span>
                   </Badge>
                 ))}
               </div>
             )}
           </Card>
-          <Card className="p-4 text-xs text-muted-foreground leading-relaxed">
-            <p className="flex items-center gap-1.5 mb-1 text-foreground font-medium">
-              <Video className="h-3.5 w-3.5" /> How it works
-            </p>
-            Models (EfficientDet-Lite, FaceLandmarker, GestureRecognizer) run via
-            MediaPipe Tasks WebAssembly with GPU delegate. No data ever leaves
+
+          <Card className="p-3 text-[11px] text-muted-foreground leading-relaxed">
+            <p className="text-foreground font-medium mb-1">How it works</p>
+            EfficientDet-Lite, FaceLandmarker and GestureRecognizer run via
+            MediaPipe Tasks WebAssembly with GPU acceleration. No data leaves
             your device.
           </Card>
         </aside>
