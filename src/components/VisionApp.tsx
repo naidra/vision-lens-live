@@ -11,7 +11,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Camera, Image as ImageIcon, Video, Loader2, Sparkles } from "lucide-react";
+import { Camera, Image as ImageIcon, Loader2, Sparkles, Sun, Moon, Hand, Smile, Boxes, ShieldCheck } from "lucide-react";
+import { useTheme } from "@/hooks/use-theme";
 
 type Mode = "camera" | "image" | "video";
 type Source = HTMLVideoElement | HTMLImageElement;
