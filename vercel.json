@@ -1,7 +1,7 @@
 {
   "version": 2,
   "buildCommand": "bun run build",
-  "outputDirectory": "dist",
+  "outputDirectory": "dist/client",
   "routes": [
     {
       "handle": "filesystem"
