@@ -26,6 +26,7 @@ import {
   Boxes,
   ShieldCheck,
   Dumbbell,
+  Activity,
   PersonStanding,
   RotateCcw,
 } from "lucide-react";
@@ -54,6 +55,13 @@ type RepTracker = {
   lastRepAt: number;
 };
 
+type PushUpTracker = {
+  count: number;
+  phase: RepPhase;
+  elbowExtend: RepSignalTracker;
+  lastRepAt: number;
+};
+
 const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
 
 const VISIBLE_LANDMARK = 0.45;
@@ -70,6 +78,10 @@ const REP_COOLDOWN_MS = 420;
 const REP_RISING_LOOKBACK_MS = 140;
 const REP_RISING_DELTA_MIN = 0.003;
 const REP_RISING_GRACE_MS = 260;
+const PUSHUP_RANGE_MIN = 0.1;
+const PUSHUP_POSTURE_MAX_VERTICAL_SPREAD = 0.36;
+const PUSHUP_POSTURE_MIN_HORIZONTAL_SPREAD = 0.18;
+const PUSHUP_COOLDOWN_MS = 500;
 const GESTURE_TRACKING_OPTIONS = {
   numHands: 2,
   minHandDetectionConfidence: 0.3,
@@ -84,6 +96,23 @@ const getVisibleAverage = (landmarks: NormalizedLandmark[], indices: number[]) =
   const points = indices
     .map((index) => landmarks[index])
     .filter((point) => point && point.visibility > VISIBLE_LANDMARK);
+
+  if (!points.length) return null;
+
+  return {
+    x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+    y: points.reduce((sum, point) => sum + point.y, 0) / points.length,
+  };
+};
+
+const getAverageWithMinVisibility = (
+  landmarks: NormalizedLandmark[],
+  indices: number[],
+  minVisibility: number,
+) => {
+  const points = indices
+    .map((index) => landmarks[index])
+    .filter((point) => point && (point.visibility ?? 0) >= minVisibility);
 
   if (!points.length) return null;
 
@@ -183,6 +212,33 @@ const getAverageElbowAngle = (landmarks: NormalizedLandmark[]) => {
   if (!angles.length) return null;
 
   return angles.reduce((sum, angle) => sum + angle, 0) / angles.length;
+};
+
+const getPushUpPosture = (landmarks: NormalizedLandmark[]) => {
+  const keyIndices = [11, 12, 23, 24, 25, 26, 27, 28];
+  const points = keyIndices
+    .map((index) => landmarks[index])
+    .filter((point) => point && (point.visibility ?? 0) >= REP_BODY_LANDMARK_MIN_VISIBILITY);
+  const shoulders = getAverageWithMinVisibility(
+    landmarks,
+    [11, 12],
+    REP_BODY_LANDMARK_MIN_VISIBILITY,
+  );
+  const hips = getAverageWithMinVisibility(landmarks, [23, 24], REP_BODY_LANDMARK_MIN_VISIBILITY);
+
+  if (!shoulders || !hips || points.length < 4) return false;
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const horizontalSpread = Math.max(...xs) - Math.min(...xs);
+  const verticalSpread = Math.max(...ys) - Math.min(...ys);
+  const torsoVerticalGap = Math.abs(shoulders.y - hips.y);
+
+  return (
+    horizontalSpread >= PUSHUP_POSTURE_MIN_HORIZONTAL_SPREAD &&
+    verticalSpread <= PUSHUP_POSTURE_MAX_VERTICAL_SPREAD &&
+    torsoVerticalGap <= PUSHUP_POSTURE_MAX_VERTICAL_SPREAD * 0.55
+  );
 };
 
 const updateRepSignal = (
@@ -319,6 +375,48 @@ const estimateRep = (poseRes: PoseLandmarkerResult | null, tracker: RepTracker) 
   };
 };
 
+const estimatePushUp = (poseRes: PoseLandmarkerResult | null, tracker: PushUpTracker) => {
+  const pose = poseRes?.landmarks[0];
+  if (!pose) {
+    return {
+      pushUpCount: tracker.count,
+      pushUpPhase: tracker.phase,
+      pushUpReady: false,
+      pushUpProgress: 0,
+    };
+  }
+
+  const now = performance.now();
+  const inPushUpPosture = getPushUpPosture(pose);
+  const elbowAngle = getAverageElbowAngle(pose);
+  const elbowExtend = updateRepSignal(
+    tracker.elbowExtend,
+    inPushUpPosture && elbowAngle != null ? elbowAngle / 180 : null,
+    now,
+    PUSHUP_RANGE_MIN,
+  );
+  const rising = now - tracker.elbowExtend.lastRisingAt <= REP_RISING_GRACE_MS;
+  const reachedTop = elbowExtend.reachedTop && rising;
+
+  if (reachedTop && now - tracker.lastRepAt > PUSHUP_COOLDOWN_MS) {
+    tracker.count += 1;
+    tracker.phase = "up";
+    tracker.elbowExtend.phase = "up";
+    tracker.lastRepAt = now;
+  } else if (elbowExtend.phase === "down") {
+    tracker.phase = "down";
+  } else if (tracker.phase === "calibrating" && elbowExtend.ready) {
+    tracker.phase = elbowExtend.progress > 0.5 ? "up" : "down";
+  }
+
+  return {
+    pushUpCount: tracker.count,
+    pushUpPhase: tracker.phase,
+    pushUpReady: inPushUpPosture && elbowExtend.ready,
+    pushUpProgress: inPushUpPosture ? elbowExtend.progress : 0,
+  };
+};
+
 export function VisionApp() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -333,11 +431,18 @@ export function VisionApp() {
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const lastRepSoundCountRef = useRef(0);
+  const lastPushUpSoundCountRef = useRef(0);
   const repTrackerRef = useRef<RepTracker>({
     count: 0,
     phase: "calibrating",
     height: createRepSignalTracker(),
     elbowFlex: createRepSignalTracker(),
+    elbowExtend: createRepSignalTracker(),
+    lastRepAt: 0,
+  });
+  const pushUpTrackerRef = useRef<PushUpTracker>({
+    count: 0,
+    phase: "calibrating",
     elbowExtend: createRepSignalTracker(),
     lastRepAt: 0,
   });
@@ -356,6 +461,10 @@ export function VisionApp() {
     poseDetected: false,
     repRangeReady: false,
     repProgress: 0,
+    pushUpCount: 0,
+    pushUpPhase: "calibrating" as RepPhase,
+    pushUpReady: false,
+    pushUpProgress: 0,
     fps: 0,
   });
   const fpsRef = useRef({ frames: 0, t0: performance.now() });
@@ -462,11 +571,18 @@ export function VisionApp() {
 
   const resetRepTracker = useCallback(() => {
     lastRepSoundCountRef.current = 0;
+    lastPushUpSoundCountRef.current = 0;
     repTrackerRef.current = {
       count: 0,
       phase: "calibrating",
       height: createRepSignalTracker(),
       elbowFlex: createRepSignalTracker(),
+      elbowExtend: createRepSignalTracker(),
+      lastRepAt: 0,
+    };
+    pushUpTrackerRef.current = {
+      count: 0,
+      phase: "calibrating",
       elbowExtend: createRepSignalTracker(),
       lastRepAt: 0,
     };
@@ -476,6 +592,10 @@ export function VisionApp() {
       repPhase: "calibrating",
       repRangeReady: false,
       repProgress: 0,
+      pushUpCount: 0,
+      pushUpPhase: "calibrating",
+      pushUpReady: false,
+      pushUpProgress: 0,
     }));
   }, []);
 
@@ -649,6 +769,11 @@ export function VisionApp() {
         lastRepSoundCountRef.current = reps.repCount;
         playRepSound();
       }
+      const pushUps = estimatePushUp(poseRes, pushUpTrackerRef.current);
+      if (pushUps.pushUpCount > lastPushUpSoundCountRef.current) {
+        lastPushUpSoundCountRef.current = pushUps.pushUpCount;
+        playRepSound();
+      }
 
       // FPS
       const f = fpsRef.current;
@@ -670,6 +795,10 @@ export function VisionApp() {
         poseDetected: reps.poseDetected,
         repRangeReady: reps.rangeReady,
         repProgress: reps.progress,
+        pushUpCount: pushUps.pushUpCount,
+        pushUpPhase: pushUps.pushUpPhase,
+        pushUpReady: pushUps.pushUpReady,
+        pushUpProgress: pushUps.pushUpProgress,
         fps,
       });
     },
@@ -919,6 +1048,12 @@ export function VisionApp() {
               >
                 {stats.repCount} reps
               </Badge>
+              <Badge
+                variant="secondary"
+                className="font-mono tabular-nums backdrop-blur bg-background/70"
+              >
+                {stats.pushUpCount} push-ups
+              </Badge>
             </div>
           )}
         </Card>
@@ -958,6 +1093,45 @@ export function VisionApp() {
               {stats.repRangeReady
                 ? "Move from the bottom position to the top position to count one rep."
                 : "Do one full warm-up rep so the tracker can learn your range."}
+            </p>
+          </Card>
+
+          <Card className="p-3">
+            <div className="flex items-start justify-between gap-2">
+              <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
+                <Activity className="h-3 w-3" /> Push-ups
+              </h2>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={resetRepTracker}
+                className="h-7 w-7 -mt-1 -mr-1"
+                aria-label="Reset exercise counters"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+            <div className="flex items-end justify-between gap-3">
+              <p className="text-4xl font-semibold tabular-nums leading-none">
+                {stats.pushUpCount}
+              </p>
+              <Badge
+                variant={stats.pushUpReady ? "default" : "secondary"}
+                className="capitalize text-[10px] font-normal"
+              >
+                {stats.poseDetected ? stats.pushUpPhase : "No pose"}
+              </Badge>
+            </div>
+            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-[width] duration-150"
+                style={{ width: `${Math.round(stats.pushUpProgress * 100)}%` }}
+              />
+            </div>
+            <p className="mt-2 text-[11px] text-muted-foreground leading-relaxed">
+              {stats.pushUpReady
+                ? "Lower into the push-up, then press back up to count one rep."
+                : "Get into a side-view push-up position so the tracker can learn your range."}
             </p>
           </Card>
 
