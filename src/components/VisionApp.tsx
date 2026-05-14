@@ -36,17 +36,40 @@ type Source = HTMLVideoElement | HTMLImageElement;
 type RepPhase = "calibrating" | "down" | "up";
 type GestureStat = { label: string; score: number; hand: string };
 
+type RepSignalTracker = {
+  phase: RepPhase;
+  min: number | null;
+  max: number | null;
+  smoothed: number | null;
+  samples: { value: number; t: number }[];
+  lastRisingAt: number;
+};
+
 type RepTracker = {
   count: number;
   phase: RepPhase;
-  highY: number | null;
-  lowY: number | null;
+  height: RepSignalTracker;
+  elbowFlex: RepSignalTracker;
+  elbowExtend: RepSignalTracker;
   lastRepAt: number;
 };
 
 const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
 
 const VISIBLE_LANDMARK = 0.45;
+const REP_LANDMARK_MIN_VISIBILITY = 0.18;
+const REP_BODY_LANDMARK_MIN_VISIBILITY = 0.12;
+const REP_HEIGHT_RANGE_MIN = 0.055;
+const REP_ANGLE_RANGE_MIN = 0.12;
+const REP_SAMPLE_WINDOW_MS = 4500;
+const REP_SMOOTHING = 0.44;
+const REP_OUTLIER_JUMP = 0.32;
+const REP_DOWN_THRESHOLD = 0.32;
+const REP_UP_THRESHOLD = 0.68;
+const REP_COOLDOWN_MS = 420;
+const REP_RISING_LOOKBACK_MS = 140;
+const REP_RISING_DELTA_MIN = 0.003;
+const REP_RISING_GRACE_MS = 260;
 const GESTURE_TRACKING_OPTIONS = {
   numHands: 2,
   minHandDetectionConfidence: 0.3,
@@ -70,6 +93,162 @@ const getVisibleAverage = (landmarks: NormalizedLandmark[], indices: number[]) =
   };
 };
 
+const getRepPosition = (landmarks: NormalizedLandmark[]) => {
+  const wrists = [landmarks[15], landmarks[16]].filter(Boolean);
+  const visibleWrists = wrists.filter(
+    (point) => (point.visibility ?? 0) >= REP_LANDMARK_MIN_VISIBILITY,
+  );
+  const elbows = [landmarks[13], landmarks[14]].filter(Boolean);
+  const visibleElbows = elbows.filter(
+    (point) => (point.visibility ?? 0) >= REP_LANDMARK_MIN_VISIBILITY,
+  );
+  const points = visibleWrists.length
+    ? visibleWrists
+    : visibleElbows.length
+      ? visibleElbows
+      : wrists;
+
+  if (!points.length) return null;
+
+  const totalWeight = points.reduce(
+    (sum, point) => sum + Math.max(point.visibility ?? 0, REP_LANDMARK_MIN_VISIBILITY),
+    0,
+  );
+
+  return {
+    y:
+      points.reduce(
+        (sum, point) =>
+          sum + point.y * Math.max(point.visibility ?? 0, REP_LANDMARK_MIN_VISIBILITY),
+        0,
+      ) / totalWeight,
+  };
+};
+
+const createRepSignalTracker = (): RepSignalTracker => ({
+  phase: "calibrating",
+  min: null,
+  max: null,
+  smoothed: null,
+  samples: [],
+  lastRisingAt: 0,
+});
+
+const percentile = (values: number[], ratio: number) => {
+  if (!values.length) return null;
+
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * ratio)));
+  return sorted[index];
+};
+
+const getAngle = (a: NormalizedLandmark, b: NormalizedLandmark, c: NormalizedLandmark) => {
+  const ab = { x: a.x - b.x, y: a.y - b.y };
+  const cb = { x: c.x - b.x, y: c.y - b.y };
+  const dot = ab.x * cb.x + ab.y * cb.y;
+  const mag = Math.hypot(ab.x, ab.y) * Math.hypot(cb.x, cb.y);
+
+  if (!mag) return null;
+
+  const cosine = Math.max(-1, Math.min(1, dot / mag));
+  return (Math.acos(cosine) * 180) / Math.PI;
+};
+
+const getAverageElbowAngle = (landmarks: NormalizedLandmark[]) => {
+  const sides = [
+    [11, 13, 15],
+    [12, 14, 16],
+  ] as const;
+  const angles = sides
+    .map(([shoulderIndex, elbowIndex, wristIndex]) => {
+      const shoulder = landmarks[shoulderIndex];
+      const elbow = landmarks[elbowIndex];
+      const wrist = landmarks[wristIndex];
+
+      if (
+        !shoulder ||
+        !elbow ||
+        !wrist ||
+        (shoulder.visibility ?? 0) < REP_BODY_LANDMARK_MIN_VISIBILITY ||
+        (elbow.visibility ?? 0) < REP_BODY_LANDMARK_MIN_VISIBILITY ||
+        (wrist.visibility ?? 0) < REP_BODY_LANDMARK_MIN_VISIBILITY
+      ) {
+        return null;
+      }
+
+      return getAngle(shoulder, elbow, wrist);
+    })
+    .filter((angle): angle is number => angle != null);
+
+  if (!angles.length) return null;
+
+  return angles.reduce((sum, angle) => sum + angle, 0) / angles.length;
+};
+
+const updateRepSignal = (
+  signal: RepSignalTracker,
+  value: number | null,
+  now: number,
+  minRange: number,
+) => {
+  if (value == null) {
+    return { ready: false, progress: 0, reachedTop: false, rising: false };
+  }
+
+  const lastValue = signal.smoothed ?? value;
+  const rawValue = Math.abs(value - lastValue) > REP_OUTLIER_JUMP ? lastValue : value;
+  const smoothed =
+    signal.smoothed == null
+      ? rawValue
+      : signal.smoothed + (rawValue - signal.smoothed) * REP_SMOOTHING;
+
+  signal.smoothed = smoothed;
+  signal.samples = [...signal.samples, { value: smoothed, t: now }].filter(
+    (sample) => now - sample.t <= REP_SAMPLE_WINDOW_MS,
+  );
+  const lookbackSample = [...signal.samples]
+    .reverse()
+    .find((sample) => now - sample.t >= REP_RISING_LOOKBACK_MS);
+  const rising = lookbackSample
+    ? smoothed - lookbackSample.value > REP_RISING_DELTA_MIN
+    : smoothed - lastValue > REP_RISING_DELTA_MIN;
+  if (rising) {
+    signal.lastRisingAt = now;
+  }
+
+  const values = signal.samples.map((sample) => sample.value);
+  const sampleMin = percentile(values, 0.08);
+  const sampleMax = percentile(values, 0.92);
+
+  if (sampleMin != null && sampleMax != null) {
+    signal.min = signal.min == null ? sampleMin : signal.min * 0.8 + sampleMin * 0.2;
+    signal.max = signal.max == null ? sampleMax : signal.max * 0.8 + sampleMax * 0.2;
+  }
+
+  const range = Math.max(0, (signal.max ?? smoothed) - (signal.min ?? smoothed));
+  const ready = range > minRange;
+  const progress = ready
+    ? Math.max(0, Math.min(1, (smoothed - (signal.min ?? smoothed)) / range))
+    : 0;
+
+  if (!ready) {
+    return { ready, progress, reachedTop: false, rising };
+  }
+
+  if (progress <= REP_DOWN_THRESHOLD) {
+    signal.phase = "down";
+  } else if (signal.phase === "calibrating") {
+    signal.phase = progress > 0.5 ? "up" : "down";
+  }
+
+  return {
+    ready,
+    progress,
+    rising,
+    reachedTop: progress >= REP_UP_THRESHOLD && signal.phase === "down",
+  };
+};
+
 const estimateRep = (poseRes: PoseLandmarkerResult | null, tracker: RepTracker) => {
   const pose = poseRes?.landmarks[0];
   if (!pose) {
@@ -82,44 +261,60 @@ const estimateRep = (poseRes: PoseLandmarkerResult | null, tracker: RepTracker) 
     };
   }
 
-  const wrists = getVisibleAverage(pose, [15, 16]);
-  if (!wrists) {
-    return {
-      repCount: tracker.count,
-      repPhase: tracker.phase,
-      poseDetected: true,
-      rangeReady: false,
-      progress: 0,
-    };
-  }
-
-  tracker.highY = tracker.highY == null ? wrists.y : Math.min(tracker.highY, wrists.y);
-  tracker.lowY = tracker.lowY == null ? wrists.y : Math.max(tracker.lowY, wrists.y);
-
-  const range = Math.max(0, (tracker.lowY ?? wrists.y) - (tracker.highY ?? wrists.y));
-  const rangeReady = range > 0.12;
-  const progress = rangeReady
-    ? Math.max(0, Math.min(1, ((tracker.lowY ?? wrists.y) - wrists.y) / range))
-    : 0;
   const now = performance.now();
+  const wrists = getRepPosition(pose);
+  const elbowAngle = getAverageElbowAngle(pose);
+  const height = updateRepSignal(
+    tracker.height,
+    wrists ? 1 - wrists.y : null,
+    now,
+    REP_HEIGHT_RANGE_MIN,
+  );
+  const elbowFlex = updateRepSignal(
+    tracker.elbowFlex,
+    elbowAngle == null ? null : 1 - elbowAngle / 180,
+    now,
+    REP_ANGLE_RANGE_MIN,
+  );
+  const elbowExtend = updateRepSignal(
+    tracker.elbowExtend,
+    elbowAngle == null ? null : elbowAngle / 180,
+    now,
+    REP_ANGLE_RANGE_MIN,
+  );
 
-  if (rangeReady) {
-    if (progress < 0.25) {
-      tracker.phase = "down";
-    } else if (progress > 0.75 && tracker.phase === "down" && now - tracker.lastRepAt > 600) {
-      tracker.count += 1;
-      tracker.phase = "up";
-      tracker.lastRepAt = now;
-    } else if (tracker.phase === "calibrating") {
-      tracker.phase = progress > 0.5 ? "up" : "down";
-    }
+  const handIsRising = height.ready && now - tracker.height.lastRisingAt <= REP_RISING_GRACE_MS;
+  const angleCanCount = handIsRising && height.progress >= 0.45 && tracker.height.phase === "down";
+  const reachedTop =
+    (height.reachedTop && handIsRising) ||
+    (angleCanCount && (elbowFlex.reachedTop || elbowExtend.reachedTop));
+  const ready = height.ready || elbowFlex.ready || elbowExtend.ready;
+  const progress = height.ready
+    ? height.progress
+    : Math.max(elbowFlex.progress, elbowExtend.progress);
+
+  if (reachedTop && now - tracker.lastRepAt > REP_COOLDOWN_MS) {
+    tracker.count += 1;
+    tracker.phase = "up";
+    tracker.height.phase = "up";
+    tracker.elbowFlex.phase = "up";
+    tracker.elbowExtend.phase = "up";
+    tracker.lastRepAt = now;
+  } else if (
+    [tracker.height, tracker.elbowFlex, tracker.elbowExtend].some(
+      (signal) => signal.phase === "down",
+    )
+  ) {
+    tracker.phase = "down";
+  } else if (tracker.phase === "calibrating" && ready) {
+    tracker.phase = progress > 0.5 ? "up" : "down";
   }
 
   return {
     repCount: tracker.count,
     repPhase: tracker.phase,
     poseDetected: true,
-    rangeReady,
+    rangeReady: ready,
     progress,
   };
 };
@@ -141,8 +336,9 @@ export function VisionApp() {
   const repTrackerRef = useRef<RepTracker>({
     count: 0,
     phase: "calibrating",
-    highY: null,
-    lowY: null,
+    height: createRepSignalTracker(),
+    elbowFlex: createRepSignalTracker(),
+    elbowExtend: createRepSignalTracker(),
     lastRepAt: 0,
   });
 
@@ -211,14 +407,14 @@ export function VisionApp() {
         const poseLandmarker = await PoseLandmarker.createFromOptions(fileset, {
           baseOptions: {
             modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
             delegate: "GPU",
           },
           runningMode: "VIDEO",
           numPoses: 1,
-          minPoseDetectionConfidence: 0.5,
-          minPosePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5,
+          minPoseDetectionConfidence: 0.35,
+          minPosePresenceConfidence: 0.35,
+          minTrackingConfidence: 0.35,
         });
 
         if (cancelled) {
@@ -269,8 +465,9 @@ export function VisionApp() {
     repTrackerRef.current = {
       count: 0,
       phase: "calibrating",
-      highY: null,
-      lowY: null,
+      height: createRepSignalTracker(),
+      elbowFlex: createRepSignalTracker(),
+      elbowExtend: createRepSignalTracker(),
       lastRepAt: 0,
     };
     setStats((current) => ({
