@@ -4,21 +4,125 @@ import {
   ObjectDetector,
   FaceLandmarker,
   GestureRecognizer,
+  PoseLandmarker,
   type ObjectDetectorResult,
   type FaceLandmarkerResult,
   type GestureRecognizerResult,
+  type NormalizedLandmark,
+  type PoseLandmarkerResult,
 } from "@mediapipe/tasks-vision";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Camera, Image as ImageIcon, Loader2, Sparkles, Sun, Moon, Hand, Smile, Boxes, ShieldCheck } from "lucide-react";
+import {
+  Camera,
+  Image as ImageIcon,
+  Loader2,
+  Sparkles,
+  Sun,
+  Moon,
+  Hand,
+  Smile,
+  Boxes,
+  ShieldCheck,
+  Dumbbell,
+  PersonStanding,
+  RotateCcw,
+} from "lucide-react";
 import { useTheme } from "@/hooks/use-theme";
 
 type Mode = "camera" | "image" | "video";
 type Source = HTMLVideoElement | HTMLImageElement;
+type RepPhase = "calibrating" | "down" | "up";
+type GestureStat = { label: string; score: number; hand: string };
 
-const WASM_BASE =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
+type RepTracker = {
+  count: number;
+  phase: RepPhase;
+  highY: number | null;
+  lowY: number | null;
+  lastRepAt: number;
+};
+
+const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
+
+const VISIBLE_LANDMARK = 0.45;
+const GESTURE_TRACKING_OPTIONS = {
+  numHands: 2,
+  minHandDetectionConfidence: 0.3,
+  minHandPresenceConfidence: 0.3,
+  minTrackingConfidence: 0.3,
+  cannedGesturesClassifierOptions: {
+    scoreThreshold: 0.35,
+  },
+};
+
+const getVisibleAverage = (landmarks: NormalizedLandmark[], indices: number[]) => {
+  const points = indices
+    .map((index) => landmarks[index])
+    .filter((point) => point && point.visibility > VISIBLE_LANDMARK);
+
+  if (!points.length) return null;
+
+  return {
+    x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+    y: points.reduce((sum, point) => sum + point.y, 0) / points.length,
+  };
+};
+
+const estimateRep = (poseRes: PoseLandmarkerResult | null, tracker: RepTracker) => {
+  const pose = poseRes?.landmarks[0];
+  if (!pose) {
+    return {
+      repCount: tracker.count,
+      repPhase: tracker.phase,
+      poseDetected: false,
+      rangeReady: false,
+      progress: 0,
+    };
+  }
+
+  const wrists = getVisibleAverage(pose, [15, 16]);
+  if (!wrists) {
+    return {
+      repCount: tracker.count,
+      repPhase: tracker.phase,
+      poseDetected: true,
+      rangeReady: false,
+      progress: 0,
+    };
+  }
+
+  tracker.highY = tracker.highY == null ? wrists.y : Math.min(tracker.highY, wrists.y);
+  tracker.lowY = tracker.lowY == null ? wrists.y : Math.max(tracker.lowY, wrists.y);
+
+  const range = Math.max(0, (tracker.lowY ?? wrists.y) - (tracker.highY ?? wrists.y));
+  const rangeReady = range > 0.12;
+  const progress = rangeReady
+    ? Math.max(0, Math.min(1, ((tracker.lowY ?? wrists.y) - wrists.y) / range))
+    : 0;
+  const now = performance.now();
+
+  if (rangeReady) {
+    if (progress < 0.25) {
+      tracker.phase = "down";
+    } else if (progress > 0.75 && tracker.phase === "down" && now - tracker.lastRepAt > 600) {
+      tracker.count += 1;
+      tracker.phase = "up";
+      tracker.lastRepAt = now;
+    } else if (tracker.phase === "calibrating") {
+      tracker.phase = progress > 0.5 ? "up" : "down";
+    }
+  }
+
+  return {
+    repCount: tracker.count,
+    repPhase: tracker.phase,
+    poseDetected: true,
+    rangeReady,
+    progress,
+  };
+};
 
 export function VisionApp() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -31,6 +135,16 @@ export function VisionApp() {
   const objectDetectorRef = useRef<ObjectDetector | null>(null);
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
   const gestureRecognizerRef = useRef<GestureRecognizer | null>(null);
+  const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const lastRepSoundCountRef = useRef(0);
+  const repTrackerRef = useRef<RepTracker>({
+    count: 0,
+    phase: "calibrating",
+    highY: null,
+    lowY: null,
+    lastRepAt: 0,
+  });
 
   const [loading, setLoading] = useState(true);
   const [loadProgress, setLoadProgress] = useState("Initializing WASM runtime…");
@@ -40,7 +154,12 @@ export function VisionApp() {
   const [stats, setStats] = useState({
     objects: [] as { label: string; score: number }[],
     expression: null as string | null,
-    gestures: [] as { label: string; score: number }[],
+    gestures: [] as GestureStat[],
+    repCount: 0,
+    repPhase: "calibrating" as RepPhase,
+    poseDetected: false,
+    repRangeReady: false,
+    repProgress: 0,
     fps: 0,
   });
   const fpsRef = useRef({ frames: 0, t0: performance.now() });
@@ -85,19 +204,35 @@ export function VisionApp() {
             delegate: "GPU",
           },
           runningMode: "VIDEO",
-          numHands: 2,
+          ...GESTURE_TRACKING_OPTIONS,
+        });
+
+        setLoadProgress("Loading pose landmarker…");
+        const poseLandmarker = await PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.5,
+          minPosePresenceConfidence: 0.5,
+          minTrackingConfidence: 0.5,
         });
 
         if (cancelled) {
           objectDetector.close();
           faceLandmarker.close();
           gestureRecognizer.close();
+          poseLandmarker.close();
           return;
         }
 
         objectDetectorRef.current = objectDetector;
         faceLandmarkerRef.current = faceLandmarker;
         gestureRecognizerRef.current = gestureRecognizer;
+        poseLandmarkerRef.current = poseLandmarker;
         setLoading(false);
       } catch (err) {
         console.error(err);
@@ -109,6 +244,8 @@ export function VisionApp() {
       objectDetectorRef.current?.close();
       faceLandmarkerRef.current?.close();
       gestureRecognizerRef.current?.close();
+      poseLandmarkerRef.current?.close();
+      audioContextRef.current?.close();
     };
   }, []);
 
@@ -127,6 +264,56 @@ export function VisionApp() {
     }
   }, []);
 
+  const resetRepTracker = useCallback(() => {
+    lastRepSoundCountRef.current = 0;
+    repTrackerRef.current = {
+      count: 0,
+      phase: "calibrating",
+      highY: null,
+      lowY: null,
+      lastRepAt: 0,
+    };
+    setStats((current) => ({
+      ...current,
+      repCount: 0,
+      repPhase: "calibrating",
+      repRangeReady: false,
+      repProgress: 0,
+    }));
+  }, []);
+
+  const playRepSound = useCallback(() => {
+    const AudioContextConstructor =
+      window.AudioContext ??
+      (window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+
+    if (!AudioContextConstructor) return;
+
+    const audioContext = audioContextRef.current ?? new AudioContextConstructor();
+    audioContextRef.current = audioContext;
+
+    if (audioContext.state === "suspended") {
+      void audioContext.resume();
+    }
+
+    const now = audioContext.currentTime;
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(620, now);
+    oscillator.frequency.exponentialRampToValueAtTime(440, now + 0.12);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.315, now + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    oscillator.start(now);
+    oscillator.stop(now + 0.15);
+  }, []);
+
   const draw = useCallback(
     (
       source: Source,
@@ -135,6 +322,7 @@ export function VisionApp() {
       objRes: ObjectDetectorResult | null,
       faceRes: FaceLandmarkerResult | null,
       gestRes: GestureRecognizerResult | null,
+      poseRes: PoseLandmarkerResult | null,
     ) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -183,14 +371,16 @@ export function VisionApp() {
         const blends = faceRes.faceBlendshapes?.[0]?.categories;
         if (blends && blends.length) {
           // Map specific blendshapes to friendly expressions
-          const get = (name: string) =>
-            blends.find((b) => b.categoryName === name)?.score ?? 0;
+          const get = (name: string) => blends.find((b) => b.categoryName === name)?.score ?? 0;
           const candidates: { name: string; score: number }[] = [
             { name: "Smiling", score: (get("mouthSmileLeft") + get("mouthSmileRight")) / 2 },
             { name: "Frowning", score: (get("mouthFrownLeft") + get("mouthFrownRight")) / 2 },
-            { name: "Surprised", score: (get("jawOpen") + get("eyeWideLeft") + get("eyeWideRight")) / 3 },
+            {
+              name: "Surprised",
+              score: (get("jawOpen") + get("eyeWideLeft") + get("eyeWideRight")) / 3,
+            },
             { name: "Eyes closed", score: (get("eyeBlinkLeft") + get("eyeBlinkRight")) / 2 },
-            { name: "Brows raised", score: (get("browInnerUp")) },
+            { name: "Brows raised", score: get("browInnerUp") },
             { name: "Squinting", score: (get("eyeSquintLeft") + get("eyeSquintRight")) / 2 },
           ];
           candidates.sort((a, b) => b.score - a.score);
@@ -200,7 +390,7 @@ export function VisionApp() {
       }
 
       // Hand landmarks + gestures
-      const gestures: { label: string; score: number }[] = [];
+      const gestures: GestureStat[] = [];
       if (gestRes) {
         ctx.fillStyle = "oklch(0.82 0.18 145)";
         for (const hand of gestRes.landmarks) {
@@ -210,12 +400,57 @@ export function VisionApp() {
             ctx.fill();
           }
         }
-        for (const g of gestRes.gestures) {
+        for (let i = 0; i < gestRes.gestures.length; i++) {
+          const g = gestRes.gestures[i];
           const top = g[0];
-          if (top && top.categoryName !== "None") {
-            gestures.push({ label: top.categoryName, score: top.score });
+          const handedness = gestRes.handedness[i]?.[0]?.categoryName ?? `Hand ${i + 1}`;
+          gestures.push({
+            hand: handedness,
+            label:
+              top?.categoryName === "None" ? "No gesture" : (top?.categoryName ?? "No gesture"),
+            score: top?.score ?? 0,
+          });
+        }
+      }
+
+      if (poseRes && poseRes.landmarks.length > 0) {
+        ctx.strokeStyle = "oklch(0.76 0.17 75)";
+        ctx.lineWidth = Math.max(3, sw / 320);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+
+        for (const pose of poseRes.landmarks) {
+          for (const connection of PoseLandmarker.POSE_CONNECTIONS) {
+            const start = pose[connection.start];
+            const end = pose[connection.end];
+            if (
+              !start ||
+              !end ||
+              start.visibility < VISIBLE_LANDMARK ||
+              end.visibility < VISIBLE_LANDMARK
+            ) {
+              continue;
+            }
+            ctx.beginPath();
+            ctx.moveTo(start.x * sw, start.y * sh);
+            ctx.lineTo(end.x * sw, end.y * sh);
+            ctx.stroke();
+          }
+
+          ctx.fillStyle = "oklch(0.82 0.18 75)";
+          for (const point of pose) {
+            if (point.visibility < VISIBLE_LANDMARK) continue;
+            ctx.beginPath();
+            ctx.arc(point.x * sw, point.y * sh, Math.max(3, sw / 240), 0, Math.PI * 2);
+            ctx.fill();
           }
         }
+      }
+
+      const reps = estimateRep(poseRes, repTrackerRef.current);
+      if (reps.repCount > lastRepSoundCountRef.current) {
+        lastRepSoundCountRef.current = reps.repCount;
+        playRepSound();
       }
 
       // FPS
@@ -229,10 +464,20 @@ export function VisionApp() {
         f.t0 = now;
       }
 
-      setStats({ objects: objects.slice(0, 8), expression, gestures, fps });
+      setStats({
+        objects: objects.slice(0, 8),
+        expression,
+        gestures,
+        repCount: reps.repCount,
+        repPhase: reps.repPhase,
+        poseDetected: reps.poseDetected,
+        repRangeReady: reps.rangeReady,
+        repProgress: reps.progress,
+        fps,
+      });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [playRepSound],
   );
 
   const runVideoLoop = useCallback(() => {
@@ -240,7 +485,8 @@ export function VisionApp() {
     const od = objectDetectorRef.current;
     const fl = faceLandmarkerRef.current;
     const gr = gestureRecognizerRef.current;
-    if (!video || !od || !fl || !gr) return;
+    const pl = poseLandmarkerRef.current;
+    if (!video || !od || !fl || !gr || !pl) return;
 
     const tick = () => {
       if (video.readyState >= 2 && !video.paused && !video.ended) {
@@ -250,7 +496,8 @@ export function VisionApp() {
           const objRes = od.detectForVideo(video, ts);
           const faceRes = fl.detectForVideo(video, ts);
           const gestRes = gr.recognizeForVideo(video, ts);
-          draw(video, video.videoWidth, video.videoHeight, objRes, faceRes, gestRes);
+          const poseRes = pl.detectForVideo(video, ts);
+          draw(video, video.videoWidth, video.videoHeight, objRes, faceRes, gestRes, poseRes);
         }
       }
       rafRef.current = requestAnimationFrame(tick);
@@ -262,10 +509,18 @@ export function VisionApp() {
   const startCamera = useCallback(async () => {
     stopLoop();
     stopCameraStream();
+    resetRepTracker();
     setMode("camera");
     setImageUrl(null);
     setVideoUrl(null);
     try {
+      await objectDetectorRef.current?.setOptions({ runningMode: "VIDEO" });
+      await faceLandmarkerRef.current?.setOptions({ runningMode: "VIDEO" });
+      await gestureRecognizerRef.current?.setOptions({
+        runningMode: "VIDEO",
+        ...GESTURE_TRACKING_OPTIONS,
+      });
+      await poseLandmarkerRef.current?.setOptions({ runningMode: "VIDEO" });
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
@@ -274,13 +529,12 @@ export function VisionApp() {
       v.srcObject = stream;
       v.muted = true;
       await v.play();
-      // Switch models to VIDEO mode (already are)
       runVideoLoop();
     } catch (err) {
       console.error("Camera error", err);
       alert("Could not access camera: " + (err as Error).message);
     }
-  }, [runVideoLoop, stopCameraStream, stopLoop]);
+  }, [resetRepTracker, runVideoLoop, stopCameraStream, stopLoop]);
 
   // Auto-start camera when models ready
   useEffect(() => {
@@ -294,6 +548,7 @@ export function VisionApp() {
     async (file: File) => {
       stopLoop();
       stopCameraStream();
+      resetRepTracker();
       const url = URL.createObjectURL(file);
       if (file.type.startsWith("image/")) {
         setMode("image");
@@ -309,13 +564,19 @@ export function VisionApp() {
         const od = objectDetectorRef.current!;
         const fl = faceLandmarkerRef.current!;
         const gr = gestureRecognizerRef.current!;
+        const pl = poseLandmarkerRef.current!;
         await od.setOptions({ runningMode: "IMAGE" });
         await fl.setOptions({ runningMode: "IMAGE" });
-        await gr.setOptions({ runningMode: "IMAGE" });
+        await gr.setOptions({
+          runningMode: "IMAGE",
+          ...GESTURE_TRACKING_OPTIONS,
+        });
+        await pl.setOptions({ runningMode: "IMAGE" });
         const objRes = od.detect(img);
         const faceRes = fl.detect(img);
         const gestRes = gr.recognize(img);
-        draw(img, img.naturalWidth, img.naturalHeight, objRes, faceRes, gestRes);
+        const poseRes = pl.detect(img);
+        draw(img, img.naturalWidth, img.naturalHeight, objRes, faceRes, gestRes, poseRes);
       } else if (file.type.startsWith("video/")) {
         setMode("video");
         setImageUrl(null);
@@ -323,9 +584,14 @@ export function VisionApp() {
         const od = objectDetectorRef.current!;
         const fl = faceLandmarkerRef.current!;
         const gr = gestureRecognizerRef.current!;
+        const pl = poseLandmarkerRef.current!;
         await od.setOptions({ runningMode: "VIDEO" });
         await fl.setOptions({ runningMode: "VIDEO" });
-        await gr.setOptions({ runningMode: "VIDEO" });
+        await gr.setOptions({
+          runningMode: "VIDEO",
+          ...GESTURE_TRACKING_OPTIONS,
+        });
+        await pl.setOptions({ runningMode: "VIDEO" });
         const v = videoRef.current!;
         v.srcObject = null;
         v.src = url;
@@ -335,7 +601,7 @@ export function VisionApp() {
         runVideoLoop();
       }
     },
-    [draw, runVideoLoop, stopCameraStream, stopLoop],
+    [draw, resetRepTracker, runVideoLoop, stopCameraStream, stopLoop],
   );
 
   const { theme, toggle } = useTheme();
@@ -348,10 +614,11 @@ export function VisionApp() {
             <div className="h-8 w-8 rounded-md bg-primary/10 text-primary flex items-center justify-center shrink-0">
               <Sparkles className="h-4 w-4" />
             </div>
-            <h1 className="text-sm font-semibold tracking-tight truncate">
-              BrowserVision
-            </h1>
-            <Badge variant="secondary" className="ml-1 hidden md:inline-flex text-[10px] font-normal">
+            <h1 className="text-sm font-semibold tracking-tight truncate">BrowserVision</h1>
+            <Badge
+              variant="secondary"
+              className="ml-1 hidden md:inline-flex text-[10px] font-normal"
+            >
               <ShieldCheck className="h-3 w-3 mr-1" /> 100% on-device · WASM
             </Badge>
           </div>
@@ -384,7 +651,11 @@ export function VisionApp() {
               className="h-8 w-8"
               aria-label="Toggle theme"
             >
-              {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+              {theme === "dark" ? (
+                <Sun className="h-3.5 w-3.5" />
+              ) : (
+                <Moon className="h-3.5 w-3.5" />
+              )}
             </Button>
             <input
               ref={fileInputRef}
@@ -436,17 +707,72 @@ export function VisionApp() {
 
           {!loading && (
             <div className="absolute top-2.5 left-2.5 flex gap-1.5 text-[10px]">
-              <Badge variant="secondary" className="font-mono tabular-nums backdrop-blur bg-background/70">
+              <Badge
+                variant="secondary"
+                className="font-mono tabular-nums backdrop-blur bg-background/70"
+              >
                 {stats.fps} FPS
               </Badge>
               <Badge variant="secondary" className="capitalize backdrop-blur bg-background/70">
                 {mode}
+              </Badge>
+              <Badge
+                variant="secondary"
+                className="font-mono tabular-nums backdrop-blur bg-background/70"
+              >
+                {stats.repCount} reps
               </Badge>
             </div>
           )}
         </Card>
 
         <aside className="space-y-3">
+          <Card className="p-3">
+            <div className="flex items-start justify-between gap-2">
+              <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
+                <Dumbbell className="h-3 w-3" /> Barbell reps
+              </h2>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={resetRepTracker}
+                className="h-7 w-7 -mt-1 -mr-1"
+                aria-label="Reset rep counter"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+            <div className="flex items-end justify-between gap-3">
+              <p className="text-4xl font-semibold tabular-nums leading-none">{stats.repCount}</p>
+              <Badge
+                variant={stats.repRangeReady ? "default" : "secondary"}
+                className="capitalize text-[10px] font-normal"
+              >
+                {stats.poseDetected ? stats.repPhase : "No pose"}
+              </Badge>
+            </div>
+            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-[width] duration-150"
+                style={{ width: `${Math.round(stats.repProgress * 100)}%` }}
+              />
+            </div>
+            <p className="mt-2 text-[11px] text-muted-foreground leading-relaxed">
+              {stats.repRangeReady
+                ? "Move from the bottom position to the top position to count one rep."
+                : "Do one full warm-up rep so the tracker can learn your range."}
+            </p>
+          </Card>
+
+          <Card className="p-3">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-1.5 flex items-center gap-1.5">
+              <PersonStanding className="h-3 w-3" /> Pose
+            </h2>
+            <p className="text-xl font-semibold text-foreground">
+              {stats.poseDetected ? "Detected" : "—"}
+            </p>
+          </Card>
+
           <Card className="p-3">
             <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
               <Boxes className="h-3 w-3" /> Objects
@@ -456,7 +782,11 @@ export function VisionApp() {
             ) : (
               <div className="flex flex-wrap gap-1">
                 {stats.objects.map((o, i) => (
-                  <Badge key={i} variant="default" className="capitalize text-[10px] font-normal py-0 px-1.5 h-5">
+                  <Badge
+                    key={i}
+                    variant="default"
+                    className="capitalize text-[10px] font-normal py-0 px-1.5 h-5"
+                  >
                     {o.label} <span className="opacity-60 ml-1">{(o.score * 100).toFixed(0)}%</span>
                   </Badge>
                 ))}
@@ -468,9 +798,7 @@ export function VisionApp() {
             <h2 className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground mb-1.5 flex items-center gap-1.5">
               <Smile className="h-3 w-3" /> Expression
             </h2>
-            <p className="text-xl font-semibold text-foreground">
-              {stats.expression ?? "—"}
-            </p>
+            <p className="text-xl font-semibold text-foreground">{stats.expression ?? "—"}</p>
           </Card>
 
           <Card className="p-3">
@@ -482,8 +810,13 @@ export function VisionApp() {
             ) : (
               <div className="flex flex-wrap gap-1">
                 {stats.gestures.map((g, i) => (
-                  <Badge key={i} variant="secondary" className="text-[10px] font-normal py-0 px-1.5 h-5">
-                    {g.label} <span className="opacity-60 ml-1">{(g.score * 100).toFixed(0)}%</span>
+                  <Badge
+                    key={i}
+                    variant="secondary"
+                    className="text-[10px] font-normal py-0 px-1.5 h-5"
+                  >
+                    {g.hand}: {g.label}{" "}
+                    <span className="opacity-60 ml-1">{(g.score * 100).toFixed(0)}%</span>
                   </Badge>
                 ))}
               </div>
@@ -492,9 +825,9 @@ export function VisionApp() {
 
           <Card className="p-3 text-[11px] text-muted-foreground leading-relaxed">
             <p className="text-foreground font-medium mb-1">How it works</p>
-            EfficientDet-Lite, FaceLandmarker and GestureRecognizer run via
-            MediaPipe Tasks WebAssembly with GPU acceleration. No data leaves
-            your device.
+            EfficientDet-Lite, FaceLandmarker, GestureRecognizer and PoseLandmarker run via
+            MediaPipe Tasks WebAssembly with GPU acceleration. Reps are counted from wrist height
+            cycles. No data leaves your device.
           </Card>
         </aside>
       </main>
